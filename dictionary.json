@@ -1,0 +1,71 @@
+{
+  "1233272699808256102": {
+    "pairing": 1233295725622722661,
+    "partner_log": 1233296727638020107,
+    "pings": [
+      {
+        "subject": "Math",
+        "pings": [
+          "algebra1",
+          "algebra2",
+          "geometry",
+          "trigonometry",
+          "precalculus",
+          "calculus",
+          "statistics",
+          "discretemath"
+        ],
+        "names": [
+          "Algebra 1",
+          "Algebra 2",
+          "Geometry",
+          "Trigonometry",
+          "Precalculus",
+          "Calculus",
+          "Statistics",
+          "Discrete Math"
+        ],
+        "roles": [0, 0, 0, 0, 0, 0, 0, 0],
+        "times": [0, 0, 0, 0, 0, 0, 0, 0],
+        "aliases": [["alg1"], ["alg2"], [], ["trig"], ["precalc"], ["calc"], ["stats"], []],
+        "channel": 0
+      },
+      {
+        "subject": "Science",
+        "pings": ["physics", "biology", "chemistry", "computerscience", "psychology"],
+        "names": ["Physics", "Biology", "Chemistry", "Computer Science", "Psychology"],
+        "roles": [0, 0, 0, 0, 0],
+        "times": [0, 0, 0, 0, 0],
+        "aliases": [["phys"], ["bio"], ["chem"], ["compsci", "cs"], ["psych"]],
+        "channel": 0
+      },
+      {
+        "subject": "History",
+        "pings": ["americanhistory", "europeanhistory", "worldhistory", "usgovernment"],
+        "names": ["American History", "European History", "World History", "US Government"],
+        "roles": [0, 0, 0, 0],
+        "times": [0, 0, 0, 0],
+        "aliases": [["ushistory", "apush"], ["euro"], ["world"], ["usgov"]],
+        "channel": 0
+      },
+      {
+        "subject": "Misc",
+        "pings": ["geography", "economics", "collegeapp"],
+        "names": ["Geography", "Economics", "College App"],
+        "roles": [0, 0, 0],
+        "times": [0, 0, 0],
+        "aliases": [[], ["econ"], []],
+        "channel": 0
+      },
+      {
+        "subject": "Language",
+        "pings": ["english", "french", "spanish", "arabic", "hindi", "german", "chinese", "japanese", "latin"],
+        "names": ["English", "French", "Spanish", "Arabic", "Hindi", "German", "Chinese", "Japanese", "Latin"],
+        "roles": [0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "times": [0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "aliases": [[], [], [], [], [], [], [], [], []],
+        "channel": 0
+      }
+    ]
+  }
+}
