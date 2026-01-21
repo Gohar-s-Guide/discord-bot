@@ -13,9 +13,9 @@ import storage
 PING_USE_TEST = str(os.getenv("PING_USE_TEST", "0")).lower() in ("1", "true", "yes")
 
 
-def _get_subjects_for_guild(guild_id: Optional[int]) -> List[Dict]:
-    """Return the list of subject dicts for a guild id by querying storage."""
-    return storage.get_subjects_for_guild(guild_id)
+def _get_subjects() -> List[Dict]:
+    """Return the list of subject dicts by querying storage (global subjects)."""
+    return storage.get_subjects()
 
 
 def _build_ping_choices() -> List[app_commands.Choice[str]]:
@@ -42,8 +42,7 @@ def _build_subject_choices() -> List[app_commands.Choice[str]]:
 
 async def ping_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     """Provide dynamic autocomplete choices for /ping based on the invoking guild's configured pings."""
-    guild_id = interaction.guild.id if interaction.guild else None
-    subs = _get_subjects_for_guild(guild_id)
+    subs = _get_subjects()
     choices: List[app_commands.Choice[str]] = []
     cur = (current or "").lower()
     for item in subs:
@@ -64,8 +63,7 @@ async def ping_autocomplete(interaction: discord.Interaction, current: str) -> L
 
 async def subject_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     """Autocomplete subjects for commands like /addping based on subjects available for the guild."""
-    guild_id = interaction.guild.id if interaction.guild else None
-    subs = _get_subjects_for_guild(guild_id)
+    subs = _get_subjects()
     choices: List[app_commands.Choice[str]] = []
     cur = (current or "").lower()
     for item in subs:
@@ -170,9 +168,12 @@ class PingHelper(commands.Cog):
                                 if nk and nk not in self.ping_map:
                                     self.ping_map[nk] = {"subject_item": item, "index": target_idx}
 
-    def _load_for_guild(self, guild_id: Optional[int]):
-        """Load subjects for a guild into self.subjects and rebuild the ping_map."""
-        self.subjects = _get_subjects_for_guild(guild_id)
+    def _load_subjects(self):
+        """Load subjects (global) into self.subjects and rebuild the ping_map.
+
+        Subjects are stored globally in the database.
+        """
+        self.subjects = _get_subjects()
         self._rebuild_maps()
 
     @commands.hybrid_command(name="ping", description="Ping a homework helper")
@@ -198,8 +199,7 @@ class PingHelper(commands.Cog):
             return
 
         # ensure we have the map for this guild
-        guild_id = ctx.guild.id if ctx.guild else None
-        self._load_for_guild(guild_id)
+        self._load_subjects()
 
         # find ping (case-insensitive, support aliases). Normalize subject to ignore non-alphanumerics.
         if not isinstance(subject, str):
@@ -247,7 +247,7 @@ class PingHelper(commands.Cog):
             # persist into SQLite
             try:
                 ping_value = item.get("pings", [])[idx]
-                storage.update_ping_time(guild_id or 0, item.get("subject"), ping_value, time.time())
+                storage.update_ping_time(item.get("subject"), ping_value, time.time())
             except Exception:
                 pass
         else:
@@ -276,7 +276,7 @@ class PingHelper(commands.Cog):
         # normalize token: ignore non-alphanumeric characters for prefix lookups
         token_norm = ''.join(ch for ch in token.lower() if ch.isalnum())
         # load mapping for this guild
-        self._load_for_guild(message.guild.id if message.guild else None)
+        self._load_subjects()
         lookup = self.ping_map.get(token) or self.ping_map.get(token.lower()) or (self.ping_map.get(token_norm) if token_norm else None)
         if not lookup:
             return
@@ -291,8 +291,8 @@ class PingHelper(commands.Cog):
             await ctx.reply("This command must be used in a server/guild.")
             return
         try:
-            storage.create_subject(ctx.guild.id, subject)
-            self._load_for_guild(ctx.guild.id)
+            storage.create_subject(subject)
+            self._load_subjects()
             await ctx.reply("Subject added.")
         except Exception:
             await ctx.reply("Failed to add subject.")
@@ -304,9 +304,9 @@ class PingHelper(commands.Cog):
         if ctx.guild is None:
             await ctx.reply("This command must be used in a server/guild.")
             return
-        ok = storage.add_ping(ctx.guild.id, subject, ping, name, role)
+        ok = storage.add_ping(subject, ping, name, role)
         if ok:
-            self._load_for_guild(ctx.guild.id)
+            self._load_subjects()
             await ctx.reply("Ping added.")
         else:
             await ctx.reply("Subject not found or failed to add ping.")
@@ -320,7 +320,7 @@ class PingHelper(commands.Cog):
         - /listpings <command>
         """
         # reload subjects from storage for this guild in case they were edited externally
-        self._load_for_guild(ctx.guild.id if ctx.guild else None)
+        self._load_subjects()
 
         if command:
             lookup = self.ping_map.get(command)
