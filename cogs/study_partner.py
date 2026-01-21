@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import io
 import json
 import os
 from collections import deque
@@ -13,25 +14,70 @@ from discord.ext import commands, tasks
 
 
 class StudyPartner(commands.Cog):
-    """Find study partners by queueing users, creating temporary voice+text channels,
-    pinging both users when paired, and logging the text channel messages on close.
+    """Find study partners by queueing users, creating temporary text channels,
+    reacting to the invoker when paired, and logging the text channel messages on close.
 
     Features:
     - `findpartner` (no args): join the queue; if someone waiting, pair them.
-    - creates a private voice + text channel for the pair and pings them in the invoking channel
-    - `close`: closes the pair channels, posts a transcript to `#findpartner-logs` and deletes the channels
-    - automatic closing when the voice channel is empty for a configurable timeout
+    - creates a private text channel for the pair and reacts to the invoker when paired
+    - `close`: closes the pair channel, posts a transcript to `#findpartner-logs` and deletes the channel
+    - automatic closing when the text channel is inactive for a configurable timeout
     """
-
+    
     AUTO_CLOSE_SECONDS = 300  # 5 minutes of emptiness before auto-closing
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.queue: Deque[int] = deque()  # store user IDs
-        # active: guild_id -> text_channel_id -> metadata
-        self.active: Dict[int, Dict[int, Dict]] = {}
+        # active: text_channel_id -> metadata (global across all servers)
+        self.active: Dict[int, Dict] = {}
         # metadata contains: members [ids], text_channel_id, created_at, empty_since (None or datetime)
         self.cleaner_loop.start()
+        # Load persisted queue and sessions from storage
+        try:
+            q = storage.load_queue()
+            if q:
+                self.queue = deque(q)
+        except Exception:
+            pass
+        try:
+            sessions = storage.load_sessions()
+            for s in sessions:
+                tid = s.get("text_channel_id")
+                if tid is None:
+                    continue
+                # normalize created_at to datetime (aware)
+                ca = s.get("created_at")
+                if isinstance(ca, str):
+                    try:
+                        ca_dt = datetime.datetime.fromisoformat(ca)
+                    except Exception:
+                        ca_dt = datetime.datetime.now(datetime.timezone.utc)
+                elif isinstance(ca, datetime.datetime):
+                    ca_dt = ca
+                else:
+                    ca_dt = datetime.datetime.now(datetime.timezone.utc)
+                # normalize messages' created_at to datetime
+                msgs = []
+                for m in s.get("messages", []):
+                    mcopy = dict(m)
+                    ca_m = mcopy.get("created_at")
+                    if isinstance(ca_m, str):
+                        try:
+                            mcopy["created_at"] = datetime.datetime.fromisoformat(ca_m)
+                        except Exception:
+                            mcopy["created_at"] = None
+                    msgs.append(mcopy)
+                meta = {
+                    "members": s.get("members", []),
+                    "text_channel_id": int(tid),
+                    "created_at": ca_dt,
+                    "empty_since": None,
+                    "messages": msgs,
+                }
+                self.active[int(tid)] = meta
+        except Exception:
+            pass
 
     async def _get_or_create_category(self, guild: discord.Guild) -> Optional[discord.CategoryChannel]:
         """Find a category named 'study partner' (case-insensitive) or create it."""
@@ -64,10 +110,10 @@ class StudyPartner(commands.Cog):
                 # ignore errors (permissions etc.)
                 pass
 
-    def _get_config_for_guild(self, guild_id: int) -> Optional[Dict]:
-        # Use the SQLite-backed storage layer for guild configuration
+    def _get_config(self) -> Optional[Dict]:
+        # Read global configuration values from storage (no guild context)
         try:
-            return storage.get_guild_config(guild_id)
+            return storage.get_guild_config()
         except Exception:
             return None
 
@@ -87,7 +133,7 @@ class StudyPartner(commands.Cog):
             return
 
         # If this guild is configured, only allow running the command in the configured pairing channel
-        conf = self._get_config_for_guild(guild.id)
+        conf = self._get_config()
         if conf is not None:
             pairing_channel_id = conf.get("pairing")
             if pairing_channel_id is not None and ctx.channel.id != pairing_channel_id:
@@ -103,8 +149,8 @@ class StudyPartner(commands.Cog):
         if author.bot:
             return
 
-        # Check if user is already in an active pair
-        for gdata in self.active.get(guild.id, {}).values():
+        # Check if user is already in an active pair (global)
+        for gdata in self.active.values():
             if author.id in gdata.get("members", []):
                 await ctx.reply("You're already in an active study session.")
                 return
@@ -121,6 +167,10 @@ class StudyPartner(commands.Cog):
                 color=discord.Color.dark_green(),
             )
             await ctx.reply(embed=embed)
+            try:
+                storage.save_queue(list(self.queue))
+            except Exception:
+                pass
             return
 
         # If someone is waiting, pair them
@@ -142,13 +192,13 @@ class StudyPartner(commands.Cog):
                 category = ctx.channel.category
             overwrites = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                self.bot.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True),
-                author: discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True),
-                other: discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True),
+                self.bot.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+                author: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+                other: discord.PermissionOverwrite(view_channel=True, send_messages=True),
             }
 
             # Create text channel
-            text_name = f"study-{author.display_name.lower()}-{other.display_name.lower()}"
+            text_name = f"study-{author.name.lower()}-{other.name.lower()}"
 
             text_chan = await guild.create_text_channel(
                 name=text_name[:100], overwrites=overwrites, category=category
@@ -158,24 +208,24 @@ class StudyPartner(commands.Cog):
             meta = {
                 "members": [author.id, other.id],
                 "text_channel_id": text_chan.id,
-                "created_at": datetime.datetime.utcnow(),
+                "created_at": datetime.datetime.now(datetime.timezone.utc),
                 "empty_since": None,
                 "messages": [],
             }
-            # store sessions keyed by text channel id
-            self.active.setdefault(guild.id, {})[text_chan.id] = meta
+            # store sessions keyed by text channel id (global)
+            self.active[text_chan.id] = meta
 
-            # Ping both users in the invoking channel using a nice embed
-            pair_embed = discord.Embed(
-                title="You've been paired!",
-                description=(
-                    f"{author.mention} and {other.mention} have been paired for a study session.\n\n"
-                    f"Text channel: {text_chan.mention}\n\n"
-                    "Use the text channel for coordination. Use `!close` inside the text channel when you're done."
-                ),
-                color=discord.Color.green(),
-            )
-            await ctx.send(embed=pair_embed)
+            try:
+                storage.save_session(meta)
+            except Exception:
+                pass
+
+            # React to the invoking message to indicate pairing
+            try:
+                await ctx.message.add_reaction("✅")
+            except Exception:
+                # ignore if reaction fails (permissions etc.)
+                pass
 
             # Post a starter message in the text channel
             await text_chan.send(f"Hello {author.mention} and {other.mention}! This is your private study channel. Use `!close` here to end the session when you're done.")
@@ -184,6 +234,10 @@ class StudyPartner(commands.Cog):
         # Otherwise, put user in queue
         # Otherwise, put user in queue
         self.queue.append(author.id)
+        try:
+            storage.save_queue(list(self.queue))
+        except Exception:
+            pass
         embed = discord.Embed(
             title="You've been added to the queue!",
             description=(
@@ -200,7 +254,7 @@ class StudyPartner(commands.Cog):
         """Close the session associated with this channel or the invoker.
 
         Behavior:
-        - If used inside a temp text/voice channel, closes that session.
+        - If used inside a temp text channel, closes that session.
         - Otherwise, if the invoker is a participant in a session, closes that session.
         - Logs messages to (or creates) a channel named `findpartner-logs`.
         """
@@ -209,22 +263,22 @@ class StudyPartner(commands.Cog):
             await ctx.reply("This command must be used in a server/guild.")
             return
 
-        # Determine which active session to close
+        # Determine which active session to close (search global sessions)
         session = None
-        session_voice_id = None
-        # 1) If invoked in one of the temp text/voice channels
-        for v_id, meta in self.active.get(guild.id, {}).items():
-            if ctx.channel.id in (meta.get("text_channel_id"), meta.get("voice_channel_id")):
+        session_id = None
+        # 1) If invoked in the session text channel
+        for tid, meta in self.active.items():
+            if ctx.channel.id == meta.get("text_channel_id"):
                 session = meta
-                session_voice_id = v_id
+                session_id = tid
                 break
 
         # 2) Otherwise, see if the author is a participant in any session
         if session is None:
-            for v_id, meta in self.active.get(guild.id, {}).items():
+            for tid, meta in self.active.items():
                 if ctx.author.id in meta.get("members", []):
                     session = meta
-                    session_voice_id = v_id
+                    session_id = tid
                     break
 
         if session is None:
@@ -236,185 +290,237 @@ class StudyPartner(commands.Cog):
             await ctx.reply("You don't have permission to close this session.")
             return
 
-        # Log messages
-        text_chan = guild.get_channel(session["text_channel_id"]) if session.get("text_channel_id") else None
-        transcript = []
-        # Use cached messages collected via on_message
-        for msg in session.get("messages", []):
-            ts = msg["created_at"].isoformat()
-            author_name = msg["author_name"]
-            content = msg["content"]
-            transcript.append(f"[{ts}] {author_name}: {content}")
+        # Delegate transcript building and cleanup to helper
 
-        # Additionally pull recent history just-in-case
+        # Log and cleanup via helper (which will also attempt to delete persisted session and channel)
+        closure_reason = "Closed by command"
+        try:
+            await self._log_session(guild, session, closure_reason)
+        except Exception:
+            pass
+
+        # Ensure session removed from active map if still present
+        try:
+            if session_id in self.active:
+                del self.active[session_id]
+        except Exception:
+            pass
+
+        try:
+            await ctx.reply("Session closed and logged.")
+        except Exception:
+            pass
+
+    async def _log_session(self, guild: discord.Guild, session: Dict, closure_reason: str) -> None:
+        """Helper to post a transcript as a .log file to the configured logs channel.
+
+        This builds the transcript from cached messages and channel history,
+        posts it to the configured logs channel, then attempts to delete the
+        persisted session, remove it from `self.active`, and delete the text channel.
+        """
+        if guild is None or session is None:
+            return
+
+        text_chan = None
+        if session.get("text_channel_id"):
+            try:
+                text_chan = guild.get_channel(session.get("text_channel_id"))
+            except Exception:
+                text_chan = None
+
+        # Always build transcript from cached messages and channel history
+        transcript: List[str] = []
+        for msg in session.get("messages", []):
+            ca = msg.get("created_at")
+            if isinstance(ca, datetime.datetime):
+                ts = ca.isoformat()
+            else:
+                ts = str(ca)
+            transcript.append(f"[{ts}] {msg.get('author_name')}: {msg.get('content')}")
+
         if text_chan is not None:
             try:
-                async for m in text_chan.history(limit=500):
-                    # Skip if already in transcript (best effort)
-                    if any(m.id == cached.get("id") for cached in session.get("messages", [])):
-                        continue
-                    transcript.append(f"[{m.created_at.isoformat()}] {m.author.display_name}: {m.content}")
+                cached_ids = set(c.get("id") for c in session.get("messages", []))
             except Exception:
-                # ignore read errors
+                cached_ids = set()
+            try:
+                async for m in text_chan.history(limit=500, oldest_first=True):
+                    if m.id in cached_ids:
+                        continue
+                    transcript.append(f"[{m.created_at.isoformat()}] {m.author.name} ({m.author.id}): {m.content}")
+            except Exception:
                 pass
 
-        # Post transcript to (or create) logs channel
-        # Use configured partner_log channel if present in dictionary.json
+        # Find or create logs channel (respect configured partner_log)
         logs_chan = None
-        conf = self._get_config_for_guild(guild.id)
+        try:
+            conf = self._get_config()
+        except Exception:
+            conf = None
         if conf is not None:
             partner_log_id = conf.get("partner_log")
             if partner_log_id:
-                logs_chan = guild.get_channel(partner_log_id)
-        # fallback to creating a local logs channel if not configured or not found
-        if logs_chan is None:
-            logs_name = "findpartner-logs"
-            logs_chan = discord.utils.get(guild.text_channels, name=logs_name)
-            if logs_chan is None:
                 try:
-                    logs_chan = await guild.create_text_channel(name=logs_name)
+                    logs_chan = guild.get_channel(partner_log_id)
                 except Exception:
                     logs_chan = None
 
-        if logs_chan is not None and transcript:
-            # Send in chunks if large
-            chunk_size = 1900
-            chunk = []
-            cur_len = 0
-            header = f"Transcript for session between: {', '.join(str(guild.get_member(uid)) for uid in session['members'])}"
-            await logs_chan.send(header)
-            for line in reversed(transcript):
-                if cur_len + len(line) + 1 > chunk_size:
-                    await logs_chan.send("\n".join(reversed(chunk)))
-                    chunk = [line]
-                    cur_len = len(line)
-                else:
-                    chunk.append(line)
-                    cur_len += len(line) + 1
-            if chunk:
-                await logs_chan.send("\n".join(reversed(chunk)))
+        if logs_chan is None:
+            try:
+                logs_chan = discord.utils.get(guild.text_channels, name="findpartner-logs")
+                if logs_chan is None:
+                    logs_chan = await guild.create_text_channel(name="findpartner-logs")
+            except Exception:
+                logs_chan = None
 
-        # Delete channels
+        if logs_chan is None or not transcript:
+            return
+
+        header = f"Transcript for session between: {', '.join(str(uid) for uid in session.get('members', []))} in channel {session.get('text_channel_id', 'unknown')}"
+
+        heading = (
+            f"----- PARTNER CHANNEL LOG -----\n\n"
+            f"Channel ID: {session.get('text_channel_id', 'unknown')}\n"
+            f"Created At: {session.get('created_at').isoformat() if session.get('created_at') else 'unknown'}\n"
+            f"Closed At: {datetime.datetime.utcnow().isoformat()}\n"
+            f"Closure Reason: {closure_reason}\n"
+            f"Members: {', '.join(str(guild.get_member(uid)) for uid in session.get('members', []))}\n"
+            f"Channel Name: {getattr(guild.get_channel(session.get('text_channel_id')), 'name', 'unknown')}\n\n"
+        )
+
+        content = heading + "\n".join(transcript)
+        bio = io.BytesIO(content.encode("utf-8"))
+        bio.seek(0)
+        created = session.get("created_at")
+        if isinstance(created, datetime.datetime):
+            ts = created.strftime("%Y%m%dT%H%M%SZ")
+        else:
+            ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        fname = f"session-{session.get('text_channel_id', 'unknown')}-{ts}.log"
+
         try:
-            if text_chan:
+            await logs_chan.send(header, file=discord.File(bio, filename=fname))
+        except Exception:
+            # fallback to chunked messages
+            try:
+                await logs_chan.send(header)
+                for chunk in (content[i : i + 1900] for i in range(0, len(content), 1900)):
+                    await logs_chan.send(chunk)
+            except Exception:
+                pass
+
+        # Cleanup: delete persisted session, remove from active, delete channel
+        try:
+            sid = session.get("text_channel_id")
+            if sid is not None:
+                try:
+                    storage.delete_session(sid)
+                except Exception:
+                    pass
+                try:
+                    if sid in self.active:
+                        del self.active[sid]
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            if text_chan is not None:
                 await text_chan.delete()
         except Exception:
             pass
-        try:
-            voice_chan = guild.get_channel(session.get("voice_channel_id"))
-            if voice_chan:
-                await voice_chan.delete()
-        except Exception:
-            pass
 
-        # Remove session from active
-        try:
-            del self.active[guild.id][session_voice_id]
-        except Exception:
-            pass
-
-        await ctx.reply("Session closed and logged.")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         # Capture messages in active temp text channels for transcript
         if message.author.bot:
             return
-        guild = message.guild
-        if guild is None:
+        # Capture messages in active temp text channels for transcript
+        if message.guild is None:
             return
-        for meta in self.active.get(guild.id, {}).values():
+        for meta in self.active.values():
             if message.channel.id == meta.get("text_channel_id"):
                 # cache minimal info
-                meta.setdefault("messages", []).append(
-                    {
-                        "id": message.id,
-                        "created_at": message.created_at,
-                        "author_name": message.author.display_name,
-                        "content": message.content,
-                    }
-                )
+                meta.setdefault("messages", []).append({
+                    "id": message.id,
+                    "created_at": message.created_at,
+                    "author_name": message.author.display_name,
+                    "content": message.content,
+                })
+                try:
+                    storage.save_session(meta)
+                except Exception:
+                    pass
 
     @tasks.loop(seconds=60)
     async def cleaner_loop(self):
-        """Periodic task to auto-close empty voice channels after AUTO_CLOSE_SECONDS."""
-        now = datetime.datetime.utcnow()
-        for guild_id, sessions in list(self.active.items()):
-            guild = self.bot.get_guild(guild_id)
-            if guild is None:
+        """Periodic task to auto-close inactive text channels after AUTO_CLOSE_SECONDS.
+
+        Determines inactivity by checking the latest cached message timestamp (or falling
+        back to channel history). When inactive beyond the threshold, posts a .log file
+        to the logs channel and deletes the text channel.
+        """
+        now = datetime.datetime.now(datetime.timezone.utc)
+        # active is global mapping: text_channel_id -> meta
+        for text_id, meta in list(self.active.items()):
+            text_chan = self.bot.get_channel(text_id)
+            if text_chan is None:
+                try:
+                    del self.active[text_id]
+                except Exception:
+                    pass
                 continue
-            for v_id, meta in list(sessions.items()):
-                voice = guild.get_channel(v_id)
-                if voice is None:
-                    # channel deleted externally; close session
-                    # simulate closure: call close logic by building a fake context? Simpler: delete metadata
-                    try:
-                        del self.active[guild_id][v_id]
-                    except Exception:
-                        pass
-                    continue
 
-                # Check occupancy
-                members = [m for m in voice.members if not m.bot]
-                if not members:
-                    if meta.get("empty_since") is None:
-                        meta["empty_since"] = now
-                    else:
-                        elapsed = (now - meta["empty_since"]).total_seconds()
-                        if elapsed >= self.AUTO_CLOSE_SECONDS:
-                            # perform closure similar to close command
-                            # find the text channel and send a tiny note that it's being auto-closed
-                            text_chan = guild.get_channel(meta.get("text_channel_id"))
-                            if text_chan:
-                                try:
-                                    await text_chan.send("Session was empty for a while and will be closed automatically.")
-                                except Exception:
-                                    pass
-                            # call the same close routine by constructing a fake context: we'll call close() helper by invoking the command's logic
-                            # Instead of duplicating, call close by creating a dummy Context is cumbersome; we'll directly perform the delete + logging here
-                            # reuse code: build transcript and post to logs
-                            transcript = []
-                            for msg in meta.get("messages", []):
-                                ts = msg["created_at"].isoformat()
-                                transcript.append(f"[{ts}] {msg['author_name']}: {msg['content']}")
-                            # Use configured partner_log if available
-                            logs_chan = None
-                            conf = self._get_config_for_guild(guild.id)
-                            if conf is not None:
-                                partner_log_id = conf.get("partner_log")
-                                if partner_log_id:
-                                    logs_chan = guild.get_channel(partner_log_id)
-                            if logs_chan is None:
-                                try:
-                                    logs_chan = discord.utils.get(guild.text_channels, name="findpartner-logs")
-                                    if logs_chan is None:
-                                        logs_chan = await guild.create_text_channel(name="findpartner-logs")
-                                except Exception:
-                                    logs_chan = None
-                            if logs_chan is not None and transcript:
-                                await logs_chan.send(f"Auto-closed transcript for session between: {', '.join(str(guild.get_member(uid)) for uid in meta['members'])}")
-                                # send as a single message if small
-                                await logs_chan.send("\n".join(reversed(transcript)))
+            # Determine last activity timestamp
+            last_ts = None
+            if meta.get("messages"):
+                last_ts = meta.get("messages")[-1].get("created_at")
+            else:
+                try:
+                    async for m in text_chan.history(limit=1):
+                        last_ts = m.created_at
+                        break
+                except Exception:
+                    last_ts = None
 
-                            # delete channels
-                            try:
-                                if text_chan:
-                                    await text_chan.delete()
-                            except Exception:
-                                pass
-                            try:
-                                if voice:
-                                    await voice.delete()
-                            except Exception:
-                                pass
-                            # remove from active
-                            try:
-                                del self.active[guild_id][v_id]
-                            except Exception:
-                                pass
-                else:
-                    # reset empty timer
-                    meta["empty_since"] = None
+            if last_ts is None:
+                last_ts = meta.get("created_at")
+
+            # normalize last_ts when it's a string
+            if isinstance(last_ts, str):
+                try:
+                    last_ts = datetime.datetime.fromisoformat(last_ts)
+                except Exception:
+                    last_ts = None
+
+            if last_ts is None:
+                # nothing to base inactivity on; skip
+                continue
+
+            elapsed = (now - last_ts).total_seconds()
+            if elapsed < self.AUTO_CLOSE_SECONDS:
+                # still active
+                continue
+
+            # perform auto-close
+            try:
+                await text_chan.send("Session was inactive and will be closed automatically.")
+            except Exception:
+                pass
+
+            # Use helper to post transcript and perform cleanup
+            try:
+                guild = getattr(text_chan, "guild", None)
+                await self._log_session(guild, meta, "Auto-closed due to inactivity")
+            except Exception:
+                pass
+            try:
+                if text_id in self.active:
+                    del self.active[text_id]
+            except Exception:
+                pass
 
     @cleaner_loop.before_loop
     async def before_cleaner(self):

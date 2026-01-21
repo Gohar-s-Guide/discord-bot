@@ -8,8 +8,6 @@ dotenv.load_dotenv()
 
 
 class AdminCog(commands.Cog):
-    """Admin commands: owner utilities plus per-guild cog enable/disable for server admins."""
-
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
@@ -121,7 +119,7 @@ class AdminCog(commands.Cog):
         await ctx.reply(msg)
 
     @app_commands.autocomplete(cog=lambda interaction, current: AdminCog.autocomplete_cog(None, interaction, current))
-    @commands.hybrid_command(name="cog_enable", description="Enable a cog for this guild (manage_guild required)")
+    @commands.hybrid_command(name="cog_enable", description="Enable a cog (manage_guild required)")
     @commands.has_guild_permissions(manage_guild=True)
     async def enable_cog(self, ctx: commands.Context, cog: str):
         if ctx.guild is None:
@@ -130,13 +128,13 @@ class AdminCog(commands.Cog):
         cog_name = cog.replace('.py','')
         module = f"cogs.{cog_name}" if not cog_name.startswith('cogs.') else cog_name
         try:
-            storage.set_cog_enabled(ctx.guild.id, module, True)
-            await ctx.reply(f"Enabled {module} for this guild.")
+            storage.set_cog_enabled(module, True)
+            await ctx.reply(f"Enabled {module}.")
         except Exception as e:
             await ctx.reply(f"Failed to enable cog: {e}")
 
     @app_commands.autocomplete(cog=lambda interaction, current: AdminCog.autocomplete_cog(None, interaction, current))
-    @commands.hybrid_command(name="cog_disable", description="Disable a cog for this guild (manage_guild required)")
+    @commands.hybrid_command(name="cog_disable", description="Disable a cog (manage_guild required)")
     @commands.has_guild_permissions(manage_guild=True)
     async def disable_cog(self, ctx: commands.Context, cog: str):
         if ctx.guild is None:
@@ -145,8 +143,8 @@ class AdminCog(commands.Cog):
         cog_name = cog.replace('.py','')
         module = f"cogs.{cog_name}" if not cog_name.startswith('cogs.') else cog_name
         try:
-            storage.set_cog_enabled(ctx.guild.id, module, False)
-            await ctx.reply(f"Disabled {module} for this guild.")
+            storage.set_cog_enabled(module, False)
+            await ctx.reply(f"Disabled {module} for this.")
         except Exception as e:
             await ctx.reply(f"Failed to disable cog: {e}")
         # attempt to sync application commands after changing cog availability
@@ -155,6 +153,57 @@ class AdminCog(commands.Cog):
             await ctx.reply(f"Synced {len(synced)} app commands.")
         except Exception as e:
             await ctx.reply(f"Sync failed: {e}")
+
+    @commands.hybrid_command(name="set_pairing", description="Set global pairing channel ID (manage_guild required)")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def set_pairing(self, ctx: commands.Context, channel_id: int):
+        try:
+            storage.set_guild_config(pairing=channel_id)
+            await ctx.reply(f"Set pairing channel to {channel_id}.")
+        except Exception as e:
+            await ctx.reply(f"Failed to set pairing channel: {e}")
+
+    @commands.hybrid_command(name="set_partner_log", description="Set global partner log channel ID (manage_guild required)")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def set_partner_log(self, ctx: commands.Context, channel_id: int):
+        try:
+            storage.set_guild_config(partner_log=channel_id)
+            await ctx.reply(f"Set partner log channel to {channel_id}.")
+        except Exception as e:
+            await ctx.reply(f"Failed to set partner log channel: {e}")
+
+    @commands.hybrid_command(name="create_subject", description="Create a new subject in the DB (manage_guild required)")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def create_subject(self, ctx: commands.Context, subject: str):
+        try:
+            storage.create_subject(subject)
+            await ctx.reply(f"Created subject: {subject}")
+        except Exception as e:
+            await ctx.reply(f"Failed to create subject: {e}")
+
+    @commands.hybrid_command(name="add_ping", description="Add a ping to a subject (manage_guild required)")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def add_ping(self, ctx: commands.Context, subject: str, ping_value: str, name: str, role: int = 0):
+        try:
+            ok = storage.add_ping(subject, ping_value, name, role)
+            if ok:
+                await ctx.reply(f"Added ping '{ping_value}' to subject '{subject}' with name '{name}'.")
+            else:
+                await ctx.reply(f"Subject '{subject}' not found. Create it first with /create_subject.")
+        except Exception as e:
+            await ctx.reply(f"Failed to add ping: {e}")
+
+    @commands.hybrid_command(name="list_subjects", description="List subjects in the DB")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def list_subjects(self, ctx: commands.Context):
+        try:
+            subs = storage.get_all_subjects()
+            if not subs:
+                await ctx.reply("No subjects configured.")
+                return
+            await ctx.reply("Subjects:\n" + "\n".join(subs))
+        except Exception as e:
+            await ctx.reply(f"Failed to list subjects: {e}")
 
 
 class MyBot(commands.Bot):

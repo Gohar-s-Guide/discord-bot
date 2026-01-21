@@ -1,4 +1,6 @@
 import os
+import json 
+import datetime
 import sqlite3
 from typing import List, Dict, Optional, Any
 
@@ -14,82 +16,32 @@ def init_db() -> None:
     """Create database and tables if they don't exist."""
     conn = _conn()
     cur = conn.cursor()
-    # guild config
+    # key/value items table: item can be 'pairing', 'partner_log', or other keys
+    # Stored globally in `items` (no guild-specific columns).
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS guilds (
-            guild_id TEXT PRIMARY KEY,
-            pairing INTEGER,
-            partner_log INTEGER
-        )
-        """
-    )
-    # key/value per-guild items table: item can be 'pairing', 'partner_log', or other keys
-    # guild_items is a simple key/value table where each row is an item and
-    # main/test hold integer values. We intentionally do NOT store guild_id as
-    # a column; instead the special row with item='id' will hold the two guild ids
-    # (main and test) when you populate them.
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS guild_items (
+        CREATE TABLE IF NOT EXISTS items (
             item TEXT PRIMARY KEY,
             main INTEGER DEFAULT 0,
             test INTEGER DEFAULT 0
         )
         """
     )
-    # subjects: global subjects table (no guild_id) - if an old subjects table exists with guild_id
-    # migrate by preserving ids so pings.subject_id references remain valid
-    cur.execute("PRAGMA table_info(subjects)")
-    cols = [r[1] for r in cur.fetchall()]
-    if not cols:
-        # subjects table doesn't exist; create new global subjects table
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS subjects (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                subject TEXT,
-                main_channel INTEGER DEFAULT 0,
-                test_channel INTEGER DEFAULT 0,
-                category TEXT DEFAULT NULL,
-                message TEXT DEFAULT NULL,
-                footer TEXT DEFAULT NULL,
-                cooldown INTEGER DEFAULT 600
-            )
-            """
+    # subjects: global subjects table (no guild_id)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subjects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT,
+            main_channel INTEGER DEFAULT 0,
+            test_channel INTEGER DEFAULT 0,
+            category TEXT DEFAULT NULL,
+            message TEXT DEFAULT NULL,
+            footer TEXT DEFAULT NULL,
+            cooldown INTEGER DEFAULT 600
         )
-    elif "guild_id" in cols:
-        # migration: create new subjects_new without guild_id, copy rows preserving id
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS subjects_new (
-                id INTEGER PRIMARY KEY,
-                subject TEXT,
-                main_channel INTEGER DEFAULT 0,
-                test_channel INTEGER DEFAULT 0,
-                category TEXT DEFAULT NULL,
-                message TEXT DEFAULT NULL,
-                footer TEXT DEFAULT NULL,
-                cooldown INTEGER DEFAULT 600
-            )
-            """
-        )
-        # determine which columns exist in the old table and copy safely
-        old_cols = cols
-        select_cols = []
-        for c in ("id", "subject", "main_channel", "test_channel", "category", "message", "footer", "cooldown"):
-            if c in old_cols:
-                select_cols.append(c)
-            else:
-                select_cols.append(f"NULL AS {c}")
-        select_sql = ", ".join(select_cols)
-        cur.execute(f"INSERT OR IGNORE INTO subjects_new ({', '.join([ 'id','subject','main_channel','test_channel','category','message','footer','cooldown'])}) SELECT {select_sql} FROM subjects")
-        # replace old table
-        cur.execute("DROP TABLE subjects")
-        cur.execute("ALTER TABLE subjects_new RENAME TO subjects")
-    else:
-        # subjects exists and already is in the desired shape; nothing to do
-        pass
+        """
+    )
     # pings: store separate main_role/test_role for main vs test environments
     cur.execute(
         """
@@ -114,14 +66,32 @@ def init_db() -> None:
         )
         """
     )
-    # per-guild cog enable/disable
+    # queue table persists waiting user IDs in order
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS guild_cogs (
-            guild_id TEXT,
-            cog TEXT,
-            enabled INTEGER DEFAULT 1,
-            PRIMARY KEY (guild_id, cog)
+        CREATE TABLE IF NOT EXISTS partner_queue (
+            pos INTEGER PRIMARY KEY,
+            user_id INTEGER
+        )
+        """
+    )
+    # active sessions persisted across restarts
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            text_channel_id INTEGER PRIMARY KEY,
+            members TEXT,
+            created_at TEXT,
+            messages TEXT
+        )
+        """
+    )
+    # global cogs enable/disable table (one row per cog)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cogs (
+            cog TEXT PRIMARY KEY,
+            enabled INTEGER DEFAULT 1
         )
         """
     )
@@ -129,56 +99,109 @@ def init_db() -> None:
     conn.close()
 
 
-def _ensure_column(table: str, column: str, definition: str) -> None:
-    """Ensure a column exists on a table; add it if missing."""
+
+
+
+def set_cog_enabled(cog: str, enabled: bool) -> None:
     conn = _conn()
     cur = conn.cursor()
-    try:
-        cur.execute(f"PRAGMA table_info({table})")
-        cols = [r[1] for r in cur.fetchall()]
-        if column not in cols:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
-            conn.commit()
-    finally:
-        conn.close()
-
-
-# Ensure older DBs get the new columns if they were created with previous schema
-def _migrate_additional_columns() -> None:
-    # subjects: add main_channel, test_channel if missing
-    _ensure_column("subjects", "main_channel", "main_channel INTEGER DEFAULT 0")
-    _ensure_column("subjects", "test_channel", "test_channel INTEGER DEFAULT 0")
-    # pings: add main_role, test_role if missing
-    _ensure_column("pings", "main_role", "main_role INTEGER DEFAULT 0")
-    _ensure_column("pings", "test_role", "test_role INTEGER DEFAULT 0")
-
-    # Ensure there's a single 'id' item row so you can populate main/test guild IDs later.
-    conn = _conn()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT 1 FROM guild_items WHERE item = ?", ("id",))
-        if not cur.fetchone():
-            cur.execute("INSERT INTO guild_items (item, main, test) VALUES (?, 0, 0)", ("id",))
-            conn.commit()
-    except Exception:
-        # ignore if something goes wrong; this is non-critical
-        pass
-    finally:
-        conn.close()
-
-
-def set_cog_enabled(guild_id: int, cog: str, enabled: bool) -> None:
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO guild_cogs (guild_id, cog, enabled) VALUES (?, ?, ?)", (str(guild_id), cog, 1 if enabled else 0))
+    # upsert into global `cogs` table
+    cur.execute("SELECT 1 FROM cogs WHERE cog = ?", (cog,))
+    if cur.fetchone():
+        cur.execute("UPDATE cogs SET enabled = ? WHERE cog = ?", (1 if enabled else 0, cog))
+    else:
+        cur.execute("INSERT INTO cogs (cog, enabled) VALUES (?, ?)", (cog, 1 if enabled else 0))
     conn.commit()
     conn.close()
 
 
-def is_cog_enabled(guild_id: int, cog: str) -> bool:
+def save_queue(queue: List[int]) -> None:
     conn = _conn()
     cur = conn.cursor()
-    cur.execute("SELECT enabled FROM guild_cogs WHERE guild_id = ? AND cog = ?", (str(guild_id), cog))
+    cur.execute("DELETE FROM partner_queue")
+    for i, uid in enumerate(queue):
+        cur.execute("INSERT INTO partner_queue (pos, user_id) VALUES (?, ?)", (i, int(uid)))
+    conn.commit()
+    conn.close()
+
+
+def load_queue() -> List[int]:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM partner_queue ORDER BY pos")
+    rows = cur.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def save_session(session: Dict) -> None:
+    """Persist a session dict. session must include 'text_channel_id', 'members', 'created_at', 'messages'."""
+    conn = _conn()
+    cur = conn.cursor()
+    text_id = int(session.get("text_channel_id"))
+    members = json.dumps(session.get("members", []))
+    created_at = None
+    ca = session.get("created_at")
+    if isinstance(ca, datetime.datetime):
+        created_at = ca.isoformat()
+    elif isinstance(ca, str):
+        created_at = ca
+    # Ensure messages are JSON-serializable: convert any datetime to ISO strings
+    msgs_list = []
+    for m in session.get("messages", []):
+        mm = dict(m)
+        ca = mm.get("created_at")
+        if isinstance(ca, datetime.datetime):
+            mm["created_at"] = ca.isoformat()
+        mm_str = mm
+        msgs_list.append(mm_str)
+    msgs = json.dumps(msgs_list)
+    cur.execute("SELECT 1 FROM sessions WHERE text_channel_id = ?", (text_id,))
+    if cur.fetchone():
+        cur.execute("UPDATE sessions SET members = ?, created_at = ?, messages = ? WHERE text_channel_id = ?", (members, created_at, msgs, text_id))
+    else:
+        cur.execute("INSERT INTO sessions (text_channel_id, members, created_at, messages) VALUES (?, ?, ?, ?)", (text_id, members, created_at, msgs))
+    conn.commit()
+    conn.close()
+
+
+def delete_session(text_channel_id: int) -> None:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sessions WHERE text_channel_id = ?", (int(text_channel_id),))
+    conn.commit()
+    conn.close()
+
+
+def load_sessions() -> List[Dict]:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT text_channel_id, members, created_at, messages FROM sessions")
+    rows = cur.fetchall()
+    sessions = []
+    for text_id, members_json, created_at, messages_json in rows:
+        try:
+            members = json.loads(members_json) if members_json else []
+        except Exception:
+            members = []
+        try:
+            messages = json.loads(messages_json) if messages_json else []
+        except Exception:
+            messages = []
+        sessions.append({
+            "text_channel_id": int(text_id),
+            "members": members,
+            "created_at": created_at,
+            "messages": messages,
+        })
+    conn.close()
+    return sessions
+
+
+def is_cog_enabled(cog: str) -> bool:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT enabled FROM cogs WHERE cog = ?", (cog,))
     row = cur.fetchone()
     conn.close()
     if row is None:
@@ -187,10 +210,10 @@ def is_cog_enabled(guild_id: int, cog: str) -> bool:
     return bool(row[0])
 
 
-def get_guild_cogs(guild_id: int) -> Dict[str, int]:
+def get_cogs() -> Dict[str, int]:
     conn = _conn()
     cur = conn.cursor()
-    cur.execute("SELECT cog, enabled FROM guild_cogs WHERE guild_id = ?", (str(guild_id),))
+    cur.execute("SELECT cog, enabled FROM cogs")
     rows = cur.fetchall()
     conn.close()
     return {r[0]: r[1] for r in rows}
@@ -199,61 +222,65 @@ def get_guild_cogs(guild_id: int) -> Dict[str, int]:
 # Run migration helper
 # Ensure DB exists and then run migration helper to add missing columns on older DBs
 init_db()
-_migrate_additional_columns()
 
 
-def get_guild_config(guild_id: int) -> Optional[Dict[str, Any]]:
+def get_guild_config() -> Optional[Dict[str, Any]]:
+    """Return global configuration values (pairing and partner_log).
+
+    This function no longer accepts a `guild_id` — configuration is stored
+    globally in `items` and is not guild-specific.
+    """
     conn = _conn()
     cur = conn.cursor()
-    # In the new schema guild_items is global (no guild_id). Read pairing/partner_log from items.
-    cur.execute("SELECT main FROM guild_items WHERE item = ?", ("pairing",))
+    # Configuration values are stored globally in `items` (no per-guild rows).
+    cur.execute("SELECT main FROM items WHERE item = ?", ("pairing",))
     r1 = cur.fetchone()
-    cur.execute("SELECT main FROM guild_items WHERE item = ?", ("partner_log",))
+    cur.execute("SELECT main FROM items WHERE item = ?", ("partner_log",))
     r2 = cur.fetchone()
-    if r1 or r2:
-        pairing = int(r1[0]) if r1 and r1[0] else None
-        partner_log = int(r2[0]) if r2 and r2[0] else None
-        conn.close()
-        return {"pairing": pairing, "partner_log": partner_log}
 
-    # Fallback to legacy guilds table for older DBs
-    cur.execute("SELECT pairing, partner_log FROM guilds WHERE guild_id = ?", (str(guild_id),))
-    row = cur.fetchone()
+    pairing = int(r1[0]) if r1 and r1[0] else None
+    partner_log = int(r2[0]) if r2 and r2[0] else None
     conn.close()
-    if not row:
+
+    # If neither value is configured, return None to indicate no config present.
+    if pairing is None and partner_log is None:
         return None
-    return {"pairing": row[0], "partner_log": row[1]}
+    return {"pairing": pairing, "partner_log": partner_log}
 
 
-def set_guild_config(guild_id: int, pairing: Optional[int] = None, partner_log: Optional[int] = None) -> None:
+def set_guild_config(pairing: Optional[int] = None, partner_log: Optional[int] = None) -> None:
+    """Set global configuration values for pairing and partner_log.
+
+    The previous `guild_id` parameter has been removed — configuration is
+    global and stored in `items`.
+    """
     conn = _conn()
     cur = conn.cursor()
-    # Write into the new guild_items table per-item to avoid overwriting other item values
+    # Write into the items table per-item to avoid overwriting other item values
     if pairing is not None:
         # upsert pairing row (global item)
-        cur.execute("SELECT 1 FROM guild_items WHERE item = ?", ("pairing",))
+        cur.execute("SELECT 1 FROM items WHERE item = ?", ("pairing",))
         if cur.fetchone():
-            cur.execute("UPDATE guild_items SET main = ? WHERE item = ?", (int(pairing), "pairing"))
+            cur.execute("UPDATE items SET main = ? WHERE item = ?", (int(pairing), "pairing"))
         else:
-            cur.execute("INSERT INTO guild_items (item, main) VALUES (?, ?)", ("pairing", int(pairing)))
+            cur.execute("INSERT INTO items (item, main) VALUES (?, ?)", ("pairing", int(pairing)))
 
     if partner_log is not None:
-        cur.execute("SELECT 1 FROM guild_items WHERE item = ?", ("partner_log",))
+        cur.execute("SELECT 1 FROM items WHERE item = ?", ("partner_log",))
         if cur.fetchone():
-            cur.execute("UPDATE guild_items SET main = ? WHERE item = ?", (int(partner_log), "partner_log"))
+            cur.execute("UPDATE items SET main = ? WHERE item = ?", (int(partner_log), "partner_log"))
         else:
-            cur.execute("INSERT INTO guild_items (item, main) VALUES (?, ?)", ("partner_log", int(partner_log)))
+            cur.execute("INSERT INTO items (item, main) VALUES (?, ?)", ("partner_log", int(partner_log)))
 
     conn.commit()
     conn.close()
 
 
-def get_subjects_for_guild(guild_id: Optional[int]) -> List[Dict[str, Any]]:
+def get_subjects() -> List[Dict[str, Any]]:
     """Return list of subject dicts in the same shape previously used by the JSON format.
 
-    Subjects are global in the new schema (no guild_id). This function ignores the
-    guild_id argument and returns all subjects; callers should filter by channel/guild
-    membership if they need per-guild views.
+    Subjects are global in the schema. This function returns all subjects; callers
+    should filter by channel/guild membership if they need per-guild views.
     """
     conn = _conn()
     cur = conn.cursor()
@@ -303,8 +330,8 @@ def get_subjects_for_guild(guild_id: Optional[int]) -> List[Dict[str, Any]]:
     return subs
 
 
-def create_subject(guild_id: int, subject: str) -> None:
-    # subjects are global now; guild_id is ignored
+def create_subject(subject: str) -> None:
+    # subjects are global
     conn = _conn()
     cur = conn.cursor()
     cur.execute("INSERT INTO subjects (subject) VALUES (?)", (subject,))
@@ -312,8 +339,8 @@ def create_subject(guild_id: int, subject: str) -> None:
     conn.close()
 
 
-def add_ping(guild_id: int, subject: str, ping: str, name: str, role: int) -> bool:
-    # guild_id ignored because subjects are global
+def add_ping(subject: str, ping: str, name: str, role: int) -> bool:
+    # subjects are global
     conn = _conn()
     cur = conn.cursor()
     cur.execute("SELECT id FROM subjects WHERE subject = ? ORDER BY id LIMIT 1", (subject,))
@@ -332,7 +359,7 @@ def add_ping(guild_id: int, subject: str, ping: str, name: str, role: int) -> bo
     return True
 
 
-def update_ping_time(guild_id: int, subject: str, ping_value: str, timestamp: float) -> None:
+def update_ping_time(subject: str, ping_value: str, timestamp: float) -> None:
     conn = _conn()
     cur = conn.cursor()
     # find subject id
