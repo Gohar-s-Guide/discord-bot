@@ -80,32 +80,37 @@ class StudyPartner(commands.Cog):
             pass
 
     async def _get_or_create_category(self, guild: discord.Guild) -> Optional[discord.CategoryChannel]:
-        """Find a category named 'study partner' (case-insensitive) or create it."""
+        """Find the category or create it."""
         # try to find existing category (case-insensitive)
-        for c in guild.categories:
-            if c.name.lower() == "study partner":
-                return c
+        conf = self._get_config()
+        channel_id = conf.get("pairing") if conf else None
+        channel = guild.get_channel(channel_id) if channel_id else None
+        category = channel.category if channel else None
+        if category is not None:
+            return category
         # create it
         try:
-            return await guild.create_category("study partner")
+            return await guild.create_category("Matchmaking")
         except Exception:
             return None
 
     async def _cleanup_category_for_guild(self, guild: discord.Guild):
-        """Delete all channels under the 'study partner' category for a guild."""
+        """Delete all channels under the find partner category for a guild."""
         # find category
-        cat = None
-        for c in guild.categories:
-            if c.name.lower() == "study partner":
-                cat = c
-                break
-        if cat is None:
-            return
+        try:
+            conf = self._get_config()
+            channel_id = conf.get("pairing") if conf else None
+            channel = guild.get_channel(channel_id) if channel_id else None
+            category = channel.category if channel else None
+        except Exception:
+            category = None
+
 
         # delete channels in category
-        for ch in list(cat.channels):
+        for ch in list(category.channels):
             try:
-                await ch.delete()
+                if ch.id != channel_id:
+                    await ch.delete()
             except Exception:
                 # ignore errors (permissions etc.)
                 pass
