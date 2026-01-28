@@ -535,9 +535,9 @@ class StudyPartner(commands.Cog):
 async def setup(bot: commands.Bot):
     cog = StudyPartner(bot)
     await bot.add_cog(cog)
-    # cleanup any leftover channels in the 'study partner' category across guilds
+    '''# cleanup any leftover channels in the 'study partner' category across guilds
     for g in bot.guilds:
         try:
             await cog._cleanup_category_for_guild(g)
         except Exception:
-            pass
+            pass'''
